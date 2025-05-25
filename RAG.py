@@ -12,7 +12,7 @@ from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForCausalLM
 
 chat_history = []  # Chat memory
 
@@ -143,8 +143,8 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
 
     context = "\n".join(f"- {chunk}" for chunk in cleaned_chunks)
 
-    prompt = f"""
-You are a helpful marine science assistant. Based only on the provided excerpts from scientific papers, answer the user's question clearly and accurately. Do not use any information not found in the excerpts.
+    prompt = f"""You are an expert marine biologist assistant. When answering, ignore file names, page numbers, and citations, and focus on the scientific findings described. Summarize facts clearly.
+
 
 Excerpts:
 {context}
@@ -152,20 +152,19 @@ Excerpts:
 Question: {question}
 Answer:"""
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=max_length,
-            do_sample=False,
-            temperature=0.0,
-            top_p=1.0,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-    answer = tokenizer.decode(output[0], skip_special_tokens=True).strip()
-    return answer, used_sources
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
+    output = model.generate(
+        **inputs,
+        max_new_tokens=max_length,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
+    answer = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    # Strip the prompt part from the beginning
+    answer_only = answer[len(prompt):].strip()
+    return answer_only, used_sources
 
 
 def create_app(documents, index, encoder, model, tokenizer, device):
@@ -221,14 +220,18 @@ def main():
     index, encoder, _ = build_vector_store(documents)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_path = "models/flan-t5-large"
+    model_path = "models/phi-2"
     print(f"🔄 Loading {model_path} on {device}...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
     ).to(device)
+
+    # Set pad_token_id if missing
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     create_app(documents, index, encoder, model, tokenizer, device)
 
