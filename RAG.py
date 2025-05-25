@@ -1,156 +1,237 @@
 import os
-from pathlib import Path
-import fitz  # PyMuPDF
-from sentence_transformers import SentenceTransformer
-import faiss
-from tqdm import tqdm
-from typing import List, Tuple
-from langchain_core.documents import Document
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from transformers import pipeline
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import re
 import torch
+import fitz  # PyMuPDF
+import numpy as np
+import faiss
+import tkinter as tk
+from pathlib import Path
+from tqdm import tqdm
+from typing import List
+from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+chat_history = []  # Chat memory
 
 
-# Load documents from PDFs with chunking and extract titles
-def extract_title_from_text(text: str) -> str:
-    lines = text.strip().splitlines()
-    for line in lines[:5]:
-        clean_line = line.strip()
-        if len(clean_line.split()) >= 3 and len(clean_line) > 10:
-            return clean_line
-    return "Untitled Document"
+def clean_citations(text: str) -> str:
+    text = re.sub(r'\[[^\]]*\]', '', text)  # Square brackets
+    text = re.sub(r'\((?:[A-Za-z]+,?\s*\d{4}[;,\s]*)+\)', '', text)  # Author-year
+    return re.sub(r'\s+', ' ', text).strip()
 
 
-def load_documents(directory: str) -> Tuple[List[Document], List[str]]:
+def chunk_text_by_paragraphs(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+
+    chunks = []
+    current_chunk_parts = []
+    current_length = 0
+    i = 0
+
+    while i < len(paragraphs):
+        para = paragraphs[i]
+        if current_length + len(para) + 2 <= chunk_size:
+            current_chunk_parts.append(para)
+            current_length += len(para) + 2
+            i += 1
+        else:
+            chunks.append("\n\n".join(current_chunk_parts).strip())
+            # handle overlap
+            overlap_parts = []
+            overlap_len = 0
+            j = i - 1
+            while j >= 0 and overlap_len < overlap:
+                overlap_parts.insert(0, paragraphs[j])
+                overlap_len += len(paragraphs[j])
+                j -= 1
+            current_chunk_parts = overlap_parts
+            current_length = sum(len(p) + 2 for p in current_chunk_parts)
+
+    if current_chunk_parts:
+        chunks.append("\n\n".join(current_chunk_parts).strip())
+    return chunks
+
+
+def load_single_pdf(file_path: Path, chunk_size: int, overlap: int) -> List[dict]:
+    try:
+        doc = fitz.open(file_path)
+        title = doc.metadata.get("title") or file_path.stem
+        chunks = []
+
+        for i, page in enumerate(doc):
+            text = clean_citations(page.get_text().strip())
+            if text:
+                # Truncate long pages into smaller chunks
+                for j in range(0, len(text), chunk_size):
+                    chunk = text[j:j + chunk_size]
+                    chunks.append({"text": chunk, "source": f"{title} - Page {i+1}"})
+
+        return chunks
+    except Exception as e:
+        print(f"❌ Error reading {file_path.name}: {e}")
+        return []
+
+
+
+def load_documents(directory: str, chunk_size: int = 1000, overlap: int = 200) -> List[dict]:
+    pdf_paths = list(Path(directory).glob("*.pdf"))
     documents = []
-    sources = []
 
-    for file_path in Path(directory).glob("*.pdf"):
-        try:
-            doc = fitz.open(file_path)
-            title = None
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(load_single_pdf, path, chunk_size, overlap): path for path in pdf_paths}
+        for future in tqdm(futures, desc="📄 Loading PDFs", unit="file"):
+            try:
+                documents.extend(future.result())
+            except Exception as e:
+                print(f"❌ Error processing {futures[future].name}: {e}")
 
-            # Try PDF metadata title first
-            if doc.metadata and doc.metadata.get("title"):
-                title = doc.metadata["title"].strip()
-
-            # Else first line of first page
-            if not title and len(doc) > 0:
-                first_page_text = doc[0].get_text("text")
-                title = extract_title_from_text(first_page_text)
-
-            if not title:
-                title = file_path.stem  # fallback to filename
-
-            full_text = "\n".join(page.get_text("text") for page in doc)
-            chunk_size = 1000
-            for i in range(0, len(full_text), chunk_size):
-                chunk = full_text[i:i + chunk_size]
-                documents.append(Document(page_content=chunk, metadata={"source": title}))
-            sources.append(title)
-
-        except Exception as e:
-            print(f"❌ Error reading {file_path.name}: {e}")
-
-    return documents, sources
+    return documents
 
 
-# Build vector store with sentence-transformers and Faiss
-def build_vector_store(documents: List[Document]):
-    print("🔄 Building vector store...")
+def build_vector_store(documents: List[dict]):
     encoder = SentenceTransformer("all-MiniLM-L6-v2")
-
-    embeddings = []
-    for doc in tqdm(documents, desc="Encoding"):
-        text = doc.page_content.strip()
-        if text:
-            emb = encoder.encode(text, convert_to_tensor=False)
-            embeddings.append(emb)
-
-    if not embeddings:
-        raise ValueError("No valid text chunks found. Please check your documents.")
-
-    import numpy as np
+    texts = [doc["text"] for doc in documents]
+    embeddings = encoder.encode(texts, batch_size=16, show_progress_bar=True)
     embeddings = np.array(embeddings).astype("float32")
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
     return index, encoder, embeddings
 
 
-# Retrieve top k docs
-def retrieve(query: str, index, encoder, documents: List[Document], k=3) -> List[Document]:
-    query_embedding = encoder.encode(query, convert_to_tensor=False).reshape(1, -1).astype("float32")
-    D, I = index.search(query_embedding, k)
-    retrieved = [documents[i] for i in I[0]]
-    return retrieved
+def retrieve(query: str, index, encoder, documents: List[dict], k=5) -> List[dict]:
+    query_vec = encoder.encode(query).reshape(1, -1).astype("float32")
+    _, indices = index.search(query_vec, k)
+    return [documents[i] for i in indices[0]]
 
 
-# Relevance filter: pick top sentences from context relevant to query using TF-IDF
-def find_best_sentences(context: str, query: str, top_n=3) -> str:
-    sentences = [s.strip() for s in context.replace("\n", " ").split(".") if len(s.strip()) > 10]
+def extract_top_sentences(text: str, query: str, encoder, top_n=2, similarity_threshold=0.4) -> str:
+    clean_text = clean_citations(text)
+    sentences = [s.strip() for s in clean_text.replace("\n", " ").split(".") if len(s.strip()) > 20]
+
     if not sentences:
-        return context
-    vect = TfidfVectorizer().fit([query] + sentences)
-    query_vec = vect.transform([query])
-    sents_vec = vect.transform(sentences)
-    scores = cosine_similarity(query_vec, sents_vec).flatten()
-    ranked_sentences = [s for _, s in sorted(zip(scores, sentences), reverse=True)]
-    return ". ".join(ranked_sentences[:top_n])
+        return ""
+
+    sentence_embeddings = encoder.encode(sentences)
+    query_embedding = encoder.encode([query])
+    scores = cosine_similarity(query_embedding, sentence_embeddings)[0]
+
+    # Filter out weak matches
+    filtered = [(i, score) for i, score in enumerate(scores) if score >= similarity_threshold]
+    if not filtered:
+        return ""
+
+    # Sort by relevance and return top sentences
+    top_indices = [i for i, _ in sorted(filtered, key=lambda x: x[1], reverse=True)[:top_n]]
+    return ". ".join(sentences[i] for i in top_indices) + "."
 
 
-# Generate answer using Hugging Face QA pipeline
-def generate_answer(context: str, question: str, qa_pipeline) -> str:
-    try:
-        result = qa_pipeline(question=question, context=context)
-        return result.get("answer", "Sorry, I couldn't find an answer.")
-    except Exception as e:
-        return f"Error during answer generation: {e}"
+
+def generate_answer(docs: List[dict], question: str, model, tokenizer, device, encoder, max_length=256) -> tuple:
+    cleaned_chunks = []
+    used_sources = set()
+
+    for doc in docs:
+        summary = extract_top_sentences(doc["text"], question, encoder, top_n=1)
+        if summary:
+            cleaned_chunks.append(summary)
+            used_sources.add(doc["source"])
+
+    if not cleaned_chunks:
+        return "I'm sorry, I couldn't find relevant information to answer that question.", set()
+
+    context = "\n".join(f"- {chunk}" for chunk in cleaned_chunks)
+
+    prompt = f"""
+You are a helpful marine science assistant. Based only on the provided excerpts from scientific papers, answer the user's question clearly and accurately. Do not use any information not found in the excerpts.
+
+Excerpts:
+{context}
+
+Question: {question}
+Answer:"""
+
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_length,
+            do_sample=False,
+            temperature=0.0,
+            top_p=1.0,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    answer = tokenizer.decode(output[0], skip_special_tokens=True).strip()
+    return answer, used_sources
+
+
+
+
+def create_app(documents, index, encoder, model, tokenizer, device):
+    def ask():
+        question = entry.get()
+        entry.delete(0, tk.END)
+
+        def process():
+            docs = retrieve(question, index, encoder, documents, k=5)
+            raw_answer, used_sources = generate_answer(docs, question, model, tokenizer, device, encoder)
+            cleaned_answer = clean_citations(raw_answer)
+
+            chat_history.append((question, cleaned_answer))
+
+            # Format sources
+            sources = sorted(used_sources)
+            if sources:
+                formatted_sources = "\n".join(f"– {s}" for s in sources)
+                full_response = f"\nYou: {question}\nBot: {raw_answer}\n\nSources:\n{formatted_sources}\n\n"
+            else:
+                full_response = f"\nYou: {question}\nBot: {raw_answer}\n\n"
+
+            chat.insert(tk.END, full_response)
+            chat.see(tk.END)
+
+        Thread(target=process).start()
+
+    root = tk.Tk()
+    root.title("Coral Reef Assistant")
+
+    chat = tk.Text(root, wrap="word", height=25, width=90)
+    chat.pack(padx=10, pady=10)
+
+    entry = tk.Entry(root, width=80)
+    entry.pack(side=tk.LEFT, padx=10)
+    entry.bind("<Return>", lambda e: ask())
+
+    button = tk.Button(root, text="Ask", command=ask)
+    button.pack(side=tk.LEFT, padx=5)
+
+    root.mainloop()
+
 
 
 def main():
-    print("🔄 Loading documents...")
-    documents, sources = load_documents("papers")
-
+    print("🔄 Loading PDFs...")
+    documents = load_documents("papers", chunk_size=1000, overlap=200)
     if not documents:
-        print("❌ No valid documents loaded. Exiting.")
+        print("❌ No documents found.")
         return
 
+    print("🔄 Building FAISS index...")
     index, encoder, _ = build_vector_store(documents)
 
-    print("✅ Vector store ready.")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_path = "models/flan-t5-large"
+    print(f"🔄 Loading {model_path} on {device}...")
 
-    # Load QA pipeline model
-    model_path = r"models/bert-qa"  # Your local path
-    qa_pipeline = pipeline("question-answering", model=model_path, tokenizer=model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    ).to(device)
 
-    while True:
-        question = input("\n❓ Ask a question (or 'exit'): ")
-        if question.lower() == "exit":
-            break
-
-        # Retrieve top 3 chunks
-        retrieved_docs = retrieve(question, index, encoder, documents, k=3)
-
-        # Build combined context from retrieved chunks
-        combined_context = "\n---\n".join(doc.page_content for doc in retrieved_docs)
-
-        # Filter context to most relevant sentences
-        filtered_context = find_best_sentences(combined_context, question, top_n=5)
-
-        # Generate answer with filtered context
-        answer = generate_answer(filtered_context, question, qa_pipeline)
-
-        print("\n🧠 Answer:")
-        print(answer)
-
-        # Show sources for retrieved docs
-        print("\n📄 Sources:")
-        unique_sources = list(dict.fromkeys(doc.metadata.get("source", "Unknown") for doc in retrieved_docs))
-        for src in unique_sources:
-            print("-", src)
+    create_app(documents, index, encoder, model, tokenizer, device)
 
 
 if __name__ == "__main__":
