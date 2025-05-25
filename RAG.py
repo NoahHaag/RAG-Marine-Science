@@ -75,7 +75,6 @@ def load_single_pdf(file_path: Path, chunk_size: int, overlap: int) -> List[dict
         return []
 
 
-
 def load_documents(directory: str, chunk_size: int = 1000, overlap: int = 200) -> List[dict]:
     pdf_paths = list(Path(directory).glob("*.pdf"))
     documents = []
