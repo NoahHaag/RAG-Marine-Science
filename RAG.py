@@ -1,18 +1,21 @@
 import os
+import pickle
 import re
-import torch
+import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Thread
+from tkinter import filedialog
+from typing import List
+
+import faiss
 import fitz  # PyMuPDF
 import numpy as np
-import faiss
-import tkinter as tk
-from pathlib import Path
-from tqdm import tqdm
-from typing import List
-from threading import Thread
-from concurrent.futures import ThreadPoolExecutor
+import torch
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 chat_history = []  # Chat memory
 
@@ -23,71 +26,16 @@ def clean_citations(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def chunk_text_by_paragraphs(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-
-    chunks = []
-    current_chunk_parts = []
-    current_length = 0
-    i = 0
-
-    while i < len(paragraphs):
-        para = paragraphs[i]
-        if current_length + len(para) + 2 <= chunk_size:
-            current_chunk_parts.append(para)
-            current_length += len(para) + 2
-            i += 1
-        else:
-            chunks.append("\n\n".join(current_chunk_parts).strip())
-            # handle overlap
-            overlap_parts = []
-            overlap_len = 0
-            j = i - 1
-            while j >= 0 and overlap_len < overlap:
-                overlap_parts.insert(0, paragraphs[j])
-                overlap_len += len(paragraphs[j])
-                j -= 1
-            current_chunk_parts = overlap_parts
-            current_length = sum(len(p) + 2 for p in current_chunk_parts)
-
-    if current_chunk_parts:
-        chunks.append("\n\n".join(current_chunk_parts).strip())
-    return chunks
-
 def clean_excerpt(text: str) -> str:
-    # Remove square bracket citations like [12], [Smith et al., 2020]
     text = re.sub(r'\[[^\]]*\]', '', text)
-
-    # Remove author-year citations like (Smith, 2020; Jones, 2019)
     text = re.sub(r'\((?:[A-Za-z]+(?: et al\.)?,?\s*\d{4}[;,\s]*)+\)', '', text)
-
-    # Remove citations with doi or PII references (e.g. PII: 0022-0981(86)90245-5)
     text = re.sub(r'\b(?:PII|doi|DOI):?\s*[\w\-\./\(\)]+', '', text, flags=re.I)
-
-    # Remove page numbers "Page 12" or "page 12"
     text = re.sub(r'\b[Pp]age\s*\d+\b', '', text)
-
-    # Remove file names like "05 Masuda FB 108(2).indd"
-    # A rough heuristic: strings with file extensions
     text = re.sub(r'\b[\w\-. ]+\.(indd|pdf|docx|txt)\b', '', text, flags=re.I)
-
-    # Remove figure/table references "Fig. 1", "Table 2"
     text = re.sub(r'\b(Fig\.?|Figure|Table)\s*\d+\b', '', text)
-
-    # Remove parentheses with only numbers or identifiers inside e.g., "(12345)", "(ref 12)"
     text = re.sub(r'\(\s*(ref|Ref)?\s*\d+\s*\)', '', text)
-
-    # Remove multiple spaces, newlines, tabs etc.
     text = re.sub(r'\s+', ' ', text)
-
     return text.strip()
-
-
-def clean_source_name(source: str) -> str:
-    source = re.sub(r'\b[Pp]age\s*\d+\b', '', source)
-    source = re.sub(r'\b[\w\-. ]+\.(indd|pdf|docx|txt)\b', '', source, flags=re.I)
-    source = re.sub(r'\s+', ' ', source).strip()
-    return source
 
 
 def load_single_pdf(file_path: Path, chunk_size: int, overlap: int) -> List[dict]:
@@ -97,18 +45,17 @@ def load_single_pdf(file_path: Path, chunk_size: int, overlap: int) -> List[dict
         chunks = []
 
         for i, page in enumerate(doc):
-            text = clean_excerpt(page.get_text().strip())  # <-- use clean_excerpt here
+            text = clean_excerpt(page.get_text().strip())
             if text:
                 # Split long pages into chunks
                 for j in range(0, len(text), chunk_size):
                     chunk = text[j:j + chunk_size]
-                    chunks.append({"text": chunk, "source": f"{title} - Page {i+1}"})
+                    chunks.append({"text": chunk, "source": f"{title} - Page {i + 1}"})
 
         return chunks
     except Exception as e:
         print(f"❌ Error reading {file_path.name}: {e}")
         return []
-
 
 
 def load_documents(directory: str, chunk_size: int = 1000, overlap: int = 200) -> List[dict]:
@@ -126,14 +73,36 @@ def load_documents(directory: str, chunk_size: int = 1000, overlap: int = 200) -
     return documents
 
 
-def build_vector_store(documents: List[dict]):
+def build_vector_store(documents: List[dict], cache_dir="cache"):
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_emb_path = os.path.join(cache_dir, "embeddings.npy")
+    cache_docs_path = os.path.join(cache_dir, "documents.pkl")
+
+    if os.path.exists(cache_emb_path) and os.path.exists(cache_docs_path):
+        print("💾 Loading cached embeddings and documents...")
+        embeddings = np.load(cache_emb_path)
+        with open(cache_docs_path, "rb") as f:
+            documents_cached = pickle.load(f)
+
+        encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+        return index, encoder, embeddings, documents_cached
+
+    print("🔄 Computing embeddings...")
     encoder = SentenceTransformer("all-MiniLM-L6-v2")
     texts = [doc["text"] for doc in documents]
     embeddings = encoder.encode(texts, batch_size=16, show_progress_bar=True)
     embeddings = np.array(embeddings).astype("float32")
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
-    return index, encoder, embeddings
+
+    # Save to cache
+    np.save(cache_emb_path, embeddings)
+    with open(cache_docs_path, "wb") as f:
+        pickle.dump(documents, f)
+
+    return index, encoder, embeddings, documents
 
 
 def retrieve(query: str, index, encoder, documents: List[dict], k=10) -> List[dict]:
@@ -153,19 +122,22 @@ def extract_top_sentences(text: str, query: str, encoder, top_n=2, similarity_th
     query_embedding = encoder.encode([query])
     scores = cosine_similarity(query_embedding, sentence_embeddings)[0]
 
-    # Filter out weak matches
     filtered = [(i, score) for i, score in enumerate(scores) if score >= similarity_threshold]
     if not filtered:
         return ""
 
-    # Sort by relevance and return top sentences
     top_indices = [i for i, _ in sorted(filtered, key=lambda x: x[1], reverse=True)[:top_n]]
     return ". ".join(sentences[i] for i in top_indices) + "."
 
 
+def detect_short_answer_request(question: str) -> bool:
+    short_keywords = ["recap", "summary", "summarize", "short answer", "in brief", "tl;dr", "briefly", "quick overview"]
+    question_lower = question.lower()
+    return any(keyword in question_lower for keyword in short_keywords)
+
 
 def generate_answer(docs: List[dict], question: str, model, tokenizer, device, encoder,
-                    chat_history: List[tuple] = None, max_length=256) -> tuple:
+                    chat_history: List[tuple] = None, max_length=500) -> tuple:
     chat_history = chat_history or []
 
     cleaned_chunks = []
@@ -178,30 +150,46 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
             used_sources.add(doc["source"])
 
     if not cleaned_chunks:
-        return None, set()  # We'll handle fallback outside
+        return None, set()
 
     context = "\n".join(f"- {chunk}" for chunk in cleaned_chunks)
 
-    # Build chat history string (last 3 turns)
     history_str = ""
     for q, a in chat_history[-3:]:
         history_str += f"User: {q}\nAssistant: {a}\n"
 
-    prompt = f"""You are an expert marine biologist assistant. When answering, ignore file names, page numbers, 
-    and citations, and focus on the scientific findings described. Summarize facts clearly. Provide direct, clear, 
-    and well-supported answers without step-by-step reasoning unless explicitly asked.
-    For each claim in your answer, cite the relevant document (e.g. '[Source 1]') and list only up to 3 unique sources at the end.
+    short_answer = detect_short_answer_request(question)
 
-Chat history:
-{history_str}
+    # Core prompt template
+    instructions = f"""You are a marine science assistant. Use the research excerpts below to answer the **final user question only**.
 
-Excerpts:
-{context}
+    **Instructions:**
+    - Base your answer only on the excerpts below.
+    - Do not answer earlier questions again.
+    {"- This is a request for a SHORT answer. Limit your response to 2–3 sentences." if short_answer else ""}
+    - Do not repeat the same phrase or idea.
+    - Write in clear, plain English.
+    - Be concise, factual, and avoid repetition.
+    - Support claims with up to 3 source citations in the format: [Source 1].
+    - Only place citations after specific factual claims.
+    - Do **not** include file names, page numbers, or citation metadata in your answer.
+    """
 
-Question: {question}
-Answer:"""
+    prompt = f"""{instructions}
+    
+    Chat history (for reference only):
+    {history_str}
+    
+    Excerpts:
+    {context}
+    
+    Question:
+    {question}
+    
+    Answer:
+    """
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
 
     output = model.generate(
         **inputs,
@@ -210,71 +198,99 @@ Answer:"""
         do_sample=False,
     )
 
-    # The model output contains input tokens + generated tokens.
-    # So slice output to get only newly generated tokens after input length
     generated_tokens = output[0][inputs["input_ids"].shape[-1]:]
-
     answer_only = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
     return answer_only, used_sources
 
 
-
 def create_app(documents, index, encoder, model, tokenizer, device):
-    def ask():
-        question = entry.get()
-        entry.delete(0, tk.END)
-
-        def process():
-            # First try normal retrieval
-            docs = retrieve(question, index, encoder, documents, k=5)
-            raw_answer, used_sources = generate_answer(docs, question, model, tokenizer, device, encoder, chat_history)
-
-            if raw_answer is None or raw_answer.strip() == "":
-                # Fallback: Expand query with some keywords and increase k
-                expanded_query = question + " threats examples consequences"
-                docs = retrieve(expanded_query, index, encoder, documents, k=10)
-                raw_answer, used_sources = generate_answer(docs, expanded_query, model, tokenizer, device, encoder,
-                                                           chat_history)
-
-                if raw_answer is None or raw_answer.strip() == "":
-                    raw_answer = "I'm sorry, I couldn't find relevant information to answer that question."
-
-            cleaned_answer = clean_citations(raw_answer)
-
-            # Save to chat history
-            chat_history.append((question, cleaned_answer))
-
-            # Format sources
-            sources = sorted(used_sources)
-            if sources:
-                formatted_sources = "\n".join(f"– {s}" for s in sources)
-                full_response = f"\nYou: {question}\nBot: {raw_answer}\n\nSources:\n{formatted_sources}\n\n"
-            else:
-                full_response = f"\nYou: {question}\nBot: {raw_answer}\n\n"
-
-            chat.insert(tk.END, full_response)
-            chat.see(tk.END)
-
-        Thread(target=process).start()
-
-
-
     root = tk.Tk()
     root.title("Coral Reef Assistant")
 
-    chat = tk.Text(root, wrap="word", height=25, width=90)
-    chat.pack(padx=10, pady=10)
+    # Frame for chat + scrollbar
+    chat_frame = tk.Frame(root)
+    chat_frame.pack(padx=10, pady=10)
 
-    entry = tk.Entry(root, width=80)
-    entry.pack(side=tk.LEFT, padx=10)
+    scrollbar = tk.Scrollbar(chat_frame)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    chat = tk.Text(chat_frame, wrap="word", height=25, width=90, yscrollcommand=scrollbar.set)
+    chat.pack(side=tk.LEFT, fill=tk.BOTH)
+    scrollbar.config(command=chat.yview)
+
+    # Text tag styles
+    chat.tag_configure("user", foreground="blue")
+    chat.tag_configure("bot", foreground="green")
+    chat.tag_configure("source", foreground="darkorange")
+
+    # Entry + Ask button + Thinking label
+    input_frame = tk.Frame(root)
+    input_frame.pack(pady=5)
+
+    entry = tk.Entry(input_frame, width=70)
+    entry.grid(row=0, column=0, padx=5)
+    entry.focus()
+
+    thinking_label = tk.Label(input_frame, text="Thinking...", fg="gray")
+    thinking_label.grid(row=0, column=2, padx=5)
+    thinking_label.grid_remove()  # Hide initially
+
+    chat_history = []
+
+    def ask():
+        question = entry.get()
+        if not question.strip():
+            return
+        entry.delete(0, tk.END)
+
+        def process():
+            thinking_label.grid()  # Show thinking label
+
+            # Insert user question
+            chat.insert(tk.END, "\nYou asked:\n", "user")
+            chat.insert(tk.END, question + "\n\n", "user")
+            chat.insert(tk.END, "Bot answered:\n", "bot")
+            chat.see(tk.END)
+
+            # RAG logic to get answer
+            docs = retrieve(question, index, encoder, documents, k=5)
+            raw_answer, used_sources = generate_answer(docs, question, model, tokenizer, device, encoder, chat_history)
+
+            if not raw_answer or not raw_answer.strip():
+                fallback_query = question + " threats examples consequences"
+                docs = retrieve(fallback_query, index, encoder, documents, k=10)
+                raw_answer, used_sources = generate_answer(docs, fallback_query, model, tokenizer, device, encoder,
+                                                           chat_history)
+
+                if not raw_answer or not raw_answer.strip():
+                    raw_answer = "I'm sorry, I couldn't find relevant information to answer that question."
+
+            cleaned_answer = clean_citations(raw_answer)
+            chat_history.append((question, cleaned_answer))
+
+            # Insert final answer
+            chat.insert(tk.END, cleaned_answer + "\n\n", "bot")
+
+            # Insert sources
+            sources = sorted(used_sources)
+            if sources:
+                formatted_sources = "\n".join(f"– {s}" for s in sources)
+                chat.insert(tk.END, "Sources:\n", "source")
+                chat.insert(tk.END, formatted_sources + "\n", "source")
+
+            chat.insert(tk.END, "-" * 50 + "\n")
+            chat.see(tk.END)
+
+            thinking_label.grid_remove()  # Hide thinking label
+
+        Thread(target=process, daemon=True).start()
+
     entry.bind("<Return>", lambda e: ask())
-
-    button = tk.Button(root, text="Ask", command=ask)
-    button.pack(side=tk.LEFT, padx=5)
+    button = tk.Button(input_frame, text="Ask", command=ask)
+    button.grid(row=0, column=1, padx=5)
 
     root.mainloop()
-
 
 
 def main():
@@ -285,7 +301,7 @@ def main():
         return
 
     print("🔄 Building FAISS index...")
-    index, encoder, _ = build_vector_store(documents)
+    index, encoder, embeddings, documents = build_vector_store(documents)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_path = "models/phi-2"
@@ -297,7 +313,6 @@ def main():
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
     ).to(device)
 
-    # Set pad_token_id if missing
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
