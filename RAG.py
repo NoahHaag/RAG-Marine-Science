@@ -187,7 +187,10 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
     for q, a in chat_history[-3:]:
         history_str += f"User: {q}\nAssistant: {a}\n"
 
-    prompt = f"""You are an expert marine biologist assistant. When answering, ignore file names, page numbers, and citations, and focus on the scientific findings described. Summarize facts clearly.
+    prompt = f"""You are an expert marine biologist assistant. When answering, ignore file names, page numbers, 
+    and citations, and focus on the scientific findings described. Summarize facts clearly. Provide direct, clear, 
+    and well-supported answers without step-by-step reasoning unless explicitly asked.
+    For each claim in your answer, cite the relevant document (e.g. '[Source 1]') and list only up to 3 unique sources at the end.
 
 Chat history:
 {history_str}
