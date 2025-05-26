@@ -131,9 +131,21 @@ def extract_top_sentences(text: str, query: str, encoder, top_n=2, similarity_th
 
 
 def detect_short_answer_request(question: str) -> bool:
-    short_keywords = ["recap", "summary", "summarize", "short answer", "in brief", "tl;dr", "briefly", "quick overview"]
+    short_keywords = [
+        "recap", "summary", "summarize", "short answer",
+        "in brief", "tl;dr", "briefly", "quick overview",
+        "quick summary", "simplify", "just the key points"
+    ]
     question_lower = question.lower()
     return any(keyword in question_lower for keyword in short_keywords)
+
+def detect_bullet_request(question: str) -> bool:
+    bullet_keywords = [
+        "list", "what are", "types of", "examples of", "show me", "enumerate",
+        "identify", "bullet points", "categories of", "common threats", "name some"
+    ]
+    question_lower = question.lower()
+    return any(keyword in question_lower for keyword in bullet_keywords)
 
 
 def generate_answer(docs: List[dict], question: str, model, tokenizer, device, encoder,
@@ -159,41 +171,59 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
         history_str += f"User: {q}\nAssistant: {a}\n"
 
     short_answer = detect_short_answer_request(question)
+    bullet_list = detect_bullet_request(question)
 
-    # Core prompt template
+    # Instruction customization
+    if bullet_list:
+        answer_instruction = (
+            "- This is a request for a BULLET LIST.\n"
+            "- List distinct items with 1–2 line explanations.\n"
+            "- Begin each item with a dash (-), be clear and avoid redundancy.\n"
+        )
+        output_length = 150
+    elif short_answer:
+        answer_instruction = (
+            "- This is a request for a SHORT answer.\n"
+            "- Respond in 2–3 short sentences MAXIMUM.\n"
+            "- Use plain language and focus only on the main ideas.\n"
+        )
+        output_length = 120
+    else:
+        answer_instruction = ""
+        output_length = max_length
+
     instructions = f"""You are a marine science assistant. Use the research excerpts below to answer the **final user question only**.
 
-    **Instructions:**
-    - Base your answer only on the excerpts below.
-    - Do not answer earlier questions again.
-    {"- This is a request for a SHORT answer. Limit your response to 2–3 sentences." if short_answer else ""}
-    - Do not repeat the same phrase or idea.
-    - Write in clear, plain English.
-    - Be concise, factual, and avoid repetition.
-    - Support claims with up to 3 source citations in the format: [Source 1].
-    - Only place citations after specific factual claims.
-    - Do **not** include file names, page numbers, or citation metadata in your answer.
-    """
+        **Instructions:**
+        - Base your answer only on the excerpts below.
+        - Do not answer earlier questions again.
+        {answer_instruction}- Do not repeat the same phrase or idea.
+        - Write in clear, plain English.
+        - Be concise, factual, and avoid repetition.
+        - Support claims with up to 3 source citations in the format: [Source 1].
+        - Only place citations after specific factual claims.
+        - Do **not** include file names, page numbers, or citation metadata in your answer.
+        """
 
     prompt = f"""{instructions}
-    
-    Chat history (for reference only):
-    {history_str}
-    
-    Excerpts:
-    {context}
-    
-    Question:
-    {question}
-    
-    Answer:
-    """
+        
+        Chat history (for reference only):
+        {history_str}
+        
+        Excerpts:
+        {context}
+        
+        Question:
+        {question}
+        
+        Answer:
+        """
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(device)
 
     output = model.generate(
         **inputs,
-        max_new_tokens=max_length,
+        max_new_tokens=output_length,
         pad_token_id=tokenizer.pad_token_id,
         do_sample=False,
     )
@@ -204,37 +234,95 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
     return answer_only, used_sources
 
 
+
 def create_app(documents, index, encoder, model, tokenizer, device):
     root = tk.Tk()
     root.title("Coral Reef Assistant")
 
-    # Frame for chat + scrollbar
-    chat_frame = tk.Frame(root)
+    # Default colors for light mode
+    LIGHT_BG = "white"
+    LIGHT_FG = "black"
+    LIGHT_USER = "blue"
+    LIGHT_BOT = "green"
+    LIGHT_SOURCE = "darkorange"
+
+    # Colors for dark mode
+    DARK_BG = "#2e2e2e"
+    DARK_FG = "#e0e0e0"
+    DARK_USER = "#539bf5"
+    DARK_BOT = "#7cfc00"
+    DARK_SOURCE = "#ffa500"
+
+    current_theme = {
+        "bg": LIGHT_BG,
+        "fg": LIGHT_FG,
+        "user": LIGHT_USER,
+        "bot": LIGHT_BOT,
+        "source": LIGHT_SOURCE,
+    }
+
+    # Theme toggling
+    dark_mode_enabled = [False]  # use list to make mutable in nested scope
+
+    def apply_theme():
+        root.config(bg=current_theme["bg"])
+        chat.config(bg=current_theme["bg"], fg=current_theme["fg"], insertbackground=current_theme["fg"])
+        input_frame.config(bg=current_theme["bg"])
+        entry.config(bg=current_theme["bg"], fg=current_theme["fg"], insertbackground=current_theme["fg"])
+        thinking_label.config(bg=current_theme["bg"], fg="gray")
+        button.config(bg=current_theme["bg"], fg=current_theme["fg"], activebackground=current_theme["bg"])
+        toggle_button.config(bg=current_theme["bg"], fg=current_theme["fg"], activebackground=current_theme["bg"])
+        chat.tag_configure("user", foreground=current_theme["user"])
+        chat.tag_configure("bot", foreground=current_theme["bot"])
+        chat.tag_configure("source", foreground=current_theme["source"])
+
+    def toggle_dark_mode():
+        if dark_mode_enabled[0]:
+            # Switch to light mode
+            current_theme.update(
+                bg=LIGHT_BG, fg=LIGHT_FG,
+                user=LIGHT_USER, bot=LIGHT_BOT, source=LIGHT_SOURCE
+            )
+            toggle_button.config(text="Enable Dark Mode")
+            dark_mode_enabled[0] = False
+        else:
+            # Switch to dark mode
+            current_theme.update(
+                bg=DARK_BG, fg=DARK_FG,
+                user=DARK_USER, bot=DARK_BOT, source=DARK_SOURCE
+            )
+            toggle_button.config(text="Disable Dark Mode")
+            dark_mode_enabled[0] = True
+        apply_theme()
+
+    # Chat frame
+    chat_frame = tk.Frame(root, bg=current_theme["bg"])
     chat_frame.pack(padx=10, pady=10)
 
     scrollbar = tk.Scrollbar(chat_frame)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-    chat = tk.Text(chat_frame, wrap="word", height=25, width=90, yscrollcommand=scrollbar.set)
+    chat = tk.Text(chat_frame, wrap="word", height=25, width=90, yscrollcommand=scrollbar.set,
+                   bg=current_theme["bg"], fg=current_theme["fg"], insertbackground=current_theme["fg"])
     chat.pack(side=tk.LEFT, fill=tk.BOTH)
     scrollbar.config(command=chat.yview)
 
-    # Text tag styles
-    chat.tag_configure("user", foreground="blue")
-    chat.tag_configure("bot", foreground="green")
-    chat.tag_configure("source", foreground="darkorange")
+    chat.tag_configure("user", foreground=current_theme["user"])
+    chat.tag_configure("bot", foreground=current_theme["bot"])
+    chat.tag_configure("source", foreground=current_theme["source"])
 
-    # Entry + Ask button + Thinking label
-    input_frame = tk.Frame(root)
+    # Entry area
+    input_frame = tk.Frame(root, bg=current_theme["bg"])
     input_frame.pack(pady=5)
 
-    entry = tk.Entry(input_frame, width=70)
+    entry = tk.Entry(input_frame, width=70,
+                     bg=current_theme["bg"], fg=current_theme["fg"], insertbackground=current_theme["fg"])
     entry.grid(row=0, column=0, padx=5)
     entry.focus()
 
-    thinking_label = tk.Label(input_frame, text="Thinking...", fg="gray")
+    thinking_label = tk.Label(input_frame, text="Thinking...", fg="gray", bg=current_theme["bg"])
     thinking_label.grid(row=0, column=2, padx=5)
-    thinking_label.grid_remove()  # Hide initially
+    thinking_label.grid_remove()
 
     chat_history = []
 
@@ -245,23 +333,20 @@ def create_app(documents, index, encoder, model, tokenizer, device):
         entry.delete(0, tk.END)
 
         def process():
-            thinking_label.grid()  # Show thinking label
+            thinking_label.grid()
 
-            # Insert user question
             chat.insert(tk.END, "\nYou asked:\n", "user")
             chat.insert(tk.END, question + "\n\n", "user")
             chat.insert(tk.END, "Bot answered:\n", "bot")
             chat.see(tk.END)
 
-            # RAG logic to get answer
             docs = retrieve(question, index, encoder, documents, k=5)
             raw_answer, used_sources = generate_answer(docs, question, model, tokenizer, device, encoder, chat_history)
 
             if not raw_answer or not raw_answer.strip():
                 fallback_query = question + " threats examples consequences"
                 docs = retrieve(fallback_query, index, encoder, documents, k=10)
-                raw_answer, used_sources = generate_answer(docs, fallback_query, model, tokenizer, device, encoder,
-                                                           chat_history)
+                raw_answer, used_sources = generate_answer(docs, fallback_query, model, tokenizer, device, encoder, chat_history)
 
                 if not raw_answer or not raw_answer.strip():
                     raw_answer = "I'm sorry, I couldn't find relevant information to answer that question."
@@ -269,10 +354,8 @@ def create_app(documents, index, encoder, model, tokenizer, device):
             cleaned_answer = clean_citations(raw_answer)
             chat_history.append((question, cleaned_answer))
 
-            # Insert final answer
             chat.insert(tk.END, cleaned_answer + "\n\n", "bot")
 
-            # Insert sources
             sources = sorted(used_sources)
             if sources:
                 formatted_sources = "\n".join(f"– {s}" for s in sources)
@@ -282,14 +365,21 @@ def create_app(documents, index, encoder, model, tokenizer, device):
             chat.insert(tk.END, "-" * 50 + "\n")
             chat.see(tk.END)
 
-            thinking_label.grid_remove()  # Hide thinking label
+            thinking_label.grid_remove()
 
         Thread(target=process, daemon=True).start()
 
     entry.bind("<Return>", lambda e: ask())
-    button = tk.Button(input_frame, text="Ask", command=ask)
+    button = tk.Button(input_frame, text="Ask", command=ask,
+                       bg=current_theme["bg"], fg=current_theme["fg"], activebackground=current_theme["bg"])
     button.grid(row=0, column=1, padx=5)
 
+    # Dark mode toggle button
+    toggle_button = tk.Button(root, text="Enable Dark Mode", command=toggle_dark_mode,
+                              bg=current_theme["bg"], fg=current_theme["fg"], activebackground=current_theme["bg"])
+    toggle_button.pack(anchor="ne", padx=10, pady=5)
+
+    apply_theme()
     root.mainloop()
 
 
