@@ -54,6 +54,41 @@ def chunk_text_by_paragraphs(text: str, chunk_size: int = 1000, overlap: int = 2
         chunks.append("\n\n".join(current_chunk_parts).strip())
     return chunks
 
+def clean_excerpt(text: str) -> str:
+    # Remove square bracket citations like [12], [Smith et al., 2020]
+    text = re.sub(r'\[[^\]]*\]', '', text)
+
+    # Remove author-year citations like (Smith, 2020; Jones, 2019)
+    text = re.sub(r'\((?:[A-Za-z]+(?: et al\.)?,?\s*\d{4}[;,\s]*)+\)', '', text)
+
+    # Remove citations with doi or PII references (e.g. PII: 0022-0981(86)90245-5)
+    text = re.sub(r'\b(?:PII|doi|DOI):?\s*[\w\-\./\(\)]+', '', text, flags=re.I)
+
+    # Remove page numbers "Page 12" or "page 12"
+    text = re.sub(r'\b[Pp]age\s*\d+\b', '', text)
+
+    # Remove file names like "05 Masuda FB 108(2).indd"
+    # A rough heuristic: strings with file extensions
+    text = re.sub(r'\b[\w\-. ]+\.(indd|pdf|docx|txt)\b', '', text, flags=re.I)
+
+    # Remove figure/table references "Fig. 1", "Table 2"
+    text = re.sub(r'\b(Fig\.?|Figure|Table)\s*\d+\b', '', text)
+
+    # Remove parentheses with only numbers or identifiers inside e.g., "(12345)", "(ref 12)"
+    text = re.sub(r'\(\s*(ref|Ref)?\s*\d+\s*\)', '', text)
+
+    # Remove multiple spaces, newlines, tabs etc.
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
+
+
+def clean_source_name(source: str) -> str:
+    source = re.sub(r'\b[Pp]age\s*\d+\b', '', source)
+    source = re.sub(r'\b[\w\-. ]+\.(indd|pdf|docx|txt)\b', '', source, flags=re.I)
+    source = re.sub(r'\s+', ' ', source).strip()
+    return source
+
 
 def load_single_pdf(file_path: Path, chunk_size: int, overlap: int) -> List[dict]:
     try:
@@ -62,9 +97,9 @@ def load_single_pdf(file_path: Path, chunk_size: int, overlap: int) -> List[dict
         chunks = []
 
         for i, page in enumerate(doc):
-            text = clean_citations(page.get_text().strip())
+            text = clean_excerpt(page.get_text().strip())  # <-- use clean_excerpt here
             if text:
-                # Truncate long pages into smaller chunks
+                # Split long pages into chunks
                 for j in range(0, len(text), chunk_size):
                     chunk = text[j:j + chunk_size]
                     chunks.append({"text": chunk, "source": f"{title} - Page {i+1}"})
@@ -73,6 +108,7 @@ def load_single_pdf(file_path: Path, chunk_size: int, overlap: int) -> List[dict
     except Exception as e:
         print(f"❌ Error reading {file_path.name}: {e}")
         return []
+
 
 
 def load_documents(directory: str, chunk_size: int = 1000, overlap: int = 200) -> List[dict]:
@@ -100,7 +136,7 @@ def build_vector_store(documents: List[dict]):
     return index, encoder, embeddings
 
 
-def retrieve(query: str, index, encoder, documents: List[dict], k=5) -> List[dict]:
+def retrieve(query: str, index, encoder, documents: List[dict], k=10) -> List[dict]:
     query_vec = encoder.encode(query).reshape(1, -1).astype("float32")
     _, indices = index.search(query_vec, k)
     return [documents[i] for i in indices[0]]
@@ -128,23 +164,33 @@ def extract_top_sentences(text: str, query: str, encoder, top_n=2, similarity_th
 
 
 
-def generate_answer(docs: List[dict], question: str, model, tokenizer, device, encoder, max_length=256) -> tuple:
+def generate_answer(docs: List[dict], question: str, model, tokenizer, device, encoder,
+                    chat_history: List[tuple] = None, max_length=256) -> tuple:
+    chat_history = chat_history or []
+
     cleaned_chunks = []
     used_sources = set()
 
     for doc in docs:
-        summary = extract_top_sentences(doc["text"], question, encoder, top_n=1)
+        summary = extract_top_sentences(doc["text"], question, encoder, top_n=2)
         if summary:
             cleaned_chunks.append(summary)
             used_sources.add(doc["source"])
 
     if not cleaned_chunks:
-        return "I'm sorry, I couldn't find relevant information to answer that question.", set()
+        return None, set()  # We'll handle fallback outside
 
     context = "\n".join(f"- {chunk}" for chunk in cleaned_chunks)
 
+    # Build chat history string (last 3 turns)
+    history_str = ""
+    for q, a in chat_history[-3:]:
+        history_str += f"User: {q}\nAssistant: {a}\n"
+
     prompt = f"""You are an expert marine biologist assistant. When answering, ignore file names, page numbers, and citations, and focus on the scientific findings described. Summarize facts clearly.
 
+Chat history:
+{history_str}
 
 Excerpts:
 {context}
@@ -152,19 +198,23 @@ Excerpts:
 Question: {question}
 Answer:"""
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
 
     output = model.generate(
         **inputs,
         max_new_tokens=max_length,
         pad_token_id=tokenizer.pad_token_id,
+        do_sample=False,
     )
 
-    answer = tokenizer.decode(output[0], skip_special_tokens=True)
+    # The model output contains input tokens + generated tokens.
+    # So slice output to get only newly generated tokens after input length
+    generated_tokens = output[0][inputs["input_ids"].shape[-1]:]
 
-    # Strip the prompt part from the beginning
-    answer_only = answer[len(prompt):].strip()
+    answer_only = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
     return answer_only, used_sources
+
 
 
 def create_app(documents, index, encoder, model, tokenizer, device):
@@ -173,10 +223,23 @@ def create_app(documents, index, encoder, model, tokenizer, device):
         entry.delete(0, tk.END)
 
         def process():
+            # First try normal retrieval
             docs = retrieve(question, index, encoder, documents, k=5)
-            raw_answer, used_sources = generate_answer(docs, question, model, tokenizer, device, encoder)
+            raw_answer, used_sources = generate_answer(docs, question, model, tokenizer, device, encoder, chat_history)
+
+            if raw_answer is None or raw_answer.strip() == "":
+                # Fallback: Expand query with some keywords and increase k
+                expanded_query = question + " threats examples consequences"
+                docs = retrieve(expanded_query, index, encoder, documents, k=10)
+                raw_answer, used_sources = generate_answer(docs, expanded_query, model, tokenizer, device, encoder,
+                                                           chat_history)
+
+                if raw_answer is None or raw_answer.strip() == "":
+                    raw_answer = "I'm sorry, I couldn't find relevant information to answer that question."
+
             cleaned_answer = clean_citations(raw_answer)
 
+            # Save to chat history
             chat_history.append((question, cleaned_answer))
 
             # Format sources
@@ -191,6 +254,8 @@ def create_app(documents, index, encoder, model, tokenizer, device):
             chat.see(tk.END)
 
         Thread(target=process).start()
+
+
 
     root = tk.Tk()
     root.title("Coral Reef Assistant")
