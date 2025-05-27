@@ -129,7 +129,6 @@ def extract_top_sentences(text: str, query: str, encoder, top_n=2, similarity_th
     top_indices = [i for i, _ in sorted(filtered, key=lambda x: x[1], reverse=True)[:top_n]]
     return ". ".join(sentences[i] for i in top_indices) + "."
 
-
 def detect_short_answer_request(question: str) -> bool:
     short_keywords = [
         "recap", "summary", "summarize", "short answer",
@@ -139,10 +138,12 @@ def detect_short_answer_request(question: str) -> bool:
     question_lower = question.lower()
     return any(keyword in question_lower for keyword in short_keywords)
 
+
 def detect_bullet_request(question: str) -> bool:
     bullet_keywords = [
-        "list", "what are", "types of", "examples of", "show me", "enumerate",
-        "identify", "bullet points", "categories of", "common threats", "name some"
+        "list", "types of", "examples of", "show me", "enumerate",
+        "identify", "bullet points", "categories of", "name some",
+        "advantages and disadvantages", "pros and cons"
     ]
     question_lower = question.lower()
     return any(keyword in question_lower for keyword in bullet_keywords)
@@ -175,12 +176,20 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
 
     # Instruction customization
     if bullet_list:
+        list_format_hint = ""
+        if "pros and cons" in question.lower():
+            list_format_hint = (
+                "- Begin with '**Pros:**' followed by a bulleted list.\n"
+                "- Then include '**Cons:**' followed by another bulleted list.\n"
+            )
         answer_instruction = (
             "- This is a request for a BULLET LIST.\n"
+            "- Use line breaks between items.\n"
             "- List distinct items with 1–2 line explanations.\n"
-            "- Begin each item with a dash (-), be clear and avoid redundancy.\n"
+            "- Begin each item with a dash (-).\n"
+            f"{list_format_hint}"
         )
-        output_length = 150
+        output_length = 180
     elif short_answer:
         answer_instruction = (
             "- This is a request for a SHORT answer.\n"
@@ -206,7 +215,6 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
         """
 
     prompt = f"""{instructions}
-        
         Chat history (for reference only):
         {history_str}
         
@@ -232,6 +240,7 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
     answer_only = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
     return answer_only, used_sources
+
 
 
 
@@ -354,7 +363,9 @@ def create_app(documents, index, encoder, model, tokenizer, device):
             cleaned_answer = clean_citations(raw_answer)
             chat_history.append((question, cleaned_answer))
 
-            chat.insert(tk.END, cleaned_answer + "\n\n", "bot")
+            for line in cleaned_answer.strip().split("\n"):
+                chat.insert(tk.END, line + "\n", "bot")
+            chat.insert(tk.END, "\n", "bot")
 
             sources = sorted(used_sources)
             if sources:
@@ -384,14 +395,21 @@ def create_app(documents, index, encoder, model, tokenizer, device):
 
 
 def main():
+    folders = ["papers", "noaa_reports"]  # Add more folders here as needed
+
     print("🔄 Loading PDFs...")
-    documents = load_documents("papers", chunk_size=1000, overlap=200)
-    if not documents:
+    all_documents = []
+    for folder in folders:
+        print(f"📂 Loading from: {folder}")
+        docs = load_documents(folder, chunk_size=1000, overlap=200)
+        all_documents.extend(docs)
+
+    if not all_documents:
         print("❌ No documents found.")
         return
 
     print("🔄 Building FAISS index...")
-    index, encoder, embeddings, documents = build_vector_store(documents)
+    index, encoder, embeddings, all_documents = build_vector_store(all_documents)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_path = "models/phi-2"
@@ -406,7 +424,8 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    create_app(documents, index, encoder, model, tokenizer, device)
+    create_app(all_documents, index, encoder, model, tokenizer, device)
+
 
 
 if __name__ == "__main__":
