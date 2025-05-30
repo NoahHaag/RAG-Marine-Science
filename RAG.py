@@ -152,7 +152,7 @@ def detect_bullet_request(question: str) -> bool:
 def generate_answer(docs: List[dict], question: str, model, tokenizer, device, encoder,
                     chat_history: List[tuple] = None, max_length=500) -> tuple:
     chat_history = chat_history or []
-
+    print(f"[DEBUG] Inside generate_answer, got question: '{question}'")
     cleaned_chunks = []
     used_sources = set()
 
@@ -226,6 +226,8 @@ def generate_answer(docs: List[dict], question: str, model, tokenizer, device, e
         
         Answer:
         """
+
+    print(f"[DEBUG] Final prompt:\n{prompt[:500]}")  # First 500 chars
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(device)
 
@@ -336,49 +338,63 @@ def create_app(documents, index, encoder, model, tokenizer, device):
     chat_history = []
 
     def ask():
-        question = entry.get()
-        if not question.strip():
+        question = entry.get().strip()
+        if not question:
             return
         entry.delete(0, tk.END)
 
-        def process():
+        def process(user_question):
             thinking_label.grid()
+            print(f"[DEBUG] question: '{user_question}'")
 
             chat.insert(tk.END, "\nYou asked:\n", "user")
-            chat.insert(tk.END, question + "\n\n", "user")
+            chat.insert(tk.END, user_question + "\n\n", "user")
             chat.insert(tk.END, "Bot answered:\n", "bot")
             chat.see(tk.END)
 
-            docs = retrieve(question, index, encoder, documents, k=5)
-            raw_answer, used_sources = generate_answer(docs, question, model, tokenizer, device, encoder, chat_history)
+            docs = retrieve(user_question, index, encoder, documents, k=5)
+            print(f"[DEBUG] Calling generate_answer with question: '{user_question}'")
+            raw_answer, used_sources = generate_answer(docs, user_question, model, tokenizer, device, encoder,
+                                                       chat_history)
 
+            # Fallback if needed
             if not raw_answer or not raw_answer.strip():
-                fallback_query = question + " threats examples consequences"
+                fallback_query = user_question + " threats examples consequences"
                 docs = retrieve(fallback_query, index, encoder, documents, k=10)
-                raw_answer, used_sources = generate_answer(docs, fallback_query, model, tokenizer, device, encoder, chat_history)
+                raw_answer, used_sources = generate_answer(docs, fallback_query, model, tokenizer, device, encoder,
+                                                           chat_history)
 
                 if not raw_answer or not raw_answer.strip():
                     raw_answer = "I'm sorry, I couldn't find relevant information to answer that question."
 
             cleaned_answer = clean_citations(raw_answer)
-            chat_history.append((question, cleaned_answer))
+            chat_history.append((user_question, cleaned_answer))
 
-            for line in cleaned_answer.strip().split("\n"):
-                chat.insert(tk.END, line + "\n", "bot")
-            chat.insert(tk.END, "\n", "bot")
+            words = cleaned_answer.split()
+            idx = 0
 
-            sources = sorted(used_sources)
-            if sources:
-                formatted_sources = "\n".join(f"– {s}" for s in sources)
-                chat.insert(tk.END, "Sources:\n", "source")
-                chat.insert(tk.END, formatted_sources + "\n", "source")
+            def stream_words():
+                nonlocal idx
+                if idx < len(words):
+                    chat.insert(tk.END, words[idx] + " ", "bot")
+                    idx += 1
+                    chat.see(tk.END)
+                    chat.after(50, stream_words)
+                else:
+                    chat.insert(tk.END, "\n\n", "bot")
+                    if used_sources:
+                        sources = sorted(used_sources)
+                        formatted_sources = "\n".join(f"– {s}" for s in sources)
+                        chat.insert(tk.END, "Sources:\n", "source")
+                        chat.insert(tk.END, formatted_sources + "\n", "source")
+                    chat.insert(tk.END, "-" * 50 + "\n")
+                    chat.see(tk.END)
+                    thinking_label.grid_remove()
 
-            chat.insert(tk.END, "-" * 50 + "\n")
-            chat.see(tk.END)
+            stream_words()
 
-            thinking_label.grid_remove()
-
-        Thread(target=process, daemon=True).start()
+        # ✅ Pass the captured question to the thread
+        Thread(target=lambda: process(question), daemon=True).start()
 
     entry.bind("<Return>", lambda e: ask())
     button = tk.Button(input_frame, text="Ask", command=ask,
